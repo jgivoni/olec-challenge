@@ -5,6 +5,7 @@ namespace App;
 
 use App\Entity\Doctor;
 use App\Entity\Slot;
+use Carbon\Carbon;
 use DateTime;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\EntityRepository;
@@ -150,6 +151,6 @@ class DoctorSlotsSynchronizer
 
     protected function shouldReportErrors(): bool
     {
-        return (new DateTime())->format('D') !== 'Sun';
+        return (new Carbon())->format('D') !== 'Sun';
     }
 }

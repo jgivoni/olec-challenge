@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace App\Entity;
 
+use Carbon\Carbon;
 use DateTime;
 use Doctrine\ORM\Mapping as ORM;
 
@@ -44,7 +45,7 @@ final class Slot
         $this->doctorId = $doctorId;
         $this->start = $start;
         $this->end = $end;
-        $this->createdAt = new DateTime();
+        $this->createdAt = new Carbon();
     }
 
     public function getStart(): DateTime
@@ -61,6 +62,6 @@ final class Slot
 
     public function isStale(): bool
     {
-        return $this->createdAt < new DateTime('5 minutes ago');
+        return $this->createdAt < new Carbon('5 minutes ago');
     }
 }
