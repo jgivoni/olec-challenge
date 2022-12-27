@@ -10,7 +10,6 @@ use DateTime;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\EntityRepository;
 use JsonException;
-use Monolog\Handler\StreamHandler;
 use Monolog\Logger;
 
 class DoctorSlotsSynchronizer
@@ -19,39 +18,70 @@ class DoctorSlotsSynchronizer
     protected const USERNAME = 'docplanner';
     protected const PASSWORD = 'docplanner';
 
-    protected EntityRepository $repository;
-    protected EntityRepository $slots;
+    protected EntityManagerInterface $em;
     protected Logger $logger;
+    protected EntityRepository $doctorRepository;
+    protected EntityRepository $slotRepository;
 
-    public function __construct(EntityManagerInterface $em, string $logFile = 'php://stderr')
+    public function __construct(EntityManagerInterface $em, Logger $logger)
     {
-        $this->repository = $em->getRepository(Doctor::class);
-        $this->slots = $em->getRepository(Slot::class);
-        $this->logger = new Logger('logger', [new StreamHandler($logFile)]);
+        $this->em = $em;
+        $this->logger = $logger;
+    }
+
+    protected function getEntityManager(): EntityManagerInterface
+    {
+        return $this->em;
+    }
+
+    protected function getDoctorRepository(): EntityRepository
+    {
+        if (!isset($this->doctorRepository)) {
+            $this->doctorRepository = $this->getEntityManager()->getRepository(Doctor::class);
+        }
+        return $this->doctorRepository;
+    }
+
+    protected function getSlotRepository(): EntityRepository
+    {
+        if (!isset($this->slotRepository)) {
+            $this->slotRepository = $this->getEntityManager()->getRepository(Slot::class);
+        }
+        return $this->slotRepository;
     }
 
     /**
-     * @throws JsonException
      */
     public function synchronizeDoctorSlots(): void
     {
-        $doctors = $this->getJsonDecode($this->getDoctors());
+        try {
+            $doctorsData = $this->fetchDoctorsData();
 
-        foreach ($doctors as $doctor) {
-            $name = $this->normalizeName($doctor['name']);
-            /** @var Doctor $entity */
-            $entity = $this->repository->find($doctor['id']) ?? new Doctor((string)$doctor['id'], $name);
-            $entity->setName($name);
-            $entity->clearError();
-            $this->save($entity);
+            foreach ($doctorsData as $doctorData) {
+                $doctor = $this->getDoctor($doctorData['id']);
+                $doctor->setName($this->normalizeName($doctorData['name']));
+                $doctor->clearError();
 
-            foreach ($this->fetchDoctorSlots($doctor['id']) as $slot) {
-                if (false === $slot) {
-                    $entity->markError();
-                    $this->save($entity);
-                } else {
-                    $this->save($slot);
-                }
+                $this->updateDoctorSlots($doctor);
+
+                $this->save($doctor);
+            }
+        } catch (\Exception $e) {
+            if ($this->shouldReportErrors()) {
+                $this->logger->error('Error synchronizing doctor slots', [
+                    'exception' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    protected function updateDoctorSlots(Doctor $doctor): void
+    {
+        foreach ($this->fetchDoctorSlots($doctor->getId()) as $slot) {
+            if (isset($slot)) {
+                $this->save($slot);
+            } else {
+                $doctor->markError();
             }
         }
     }
@@ -59,7 +89,7 @@ class DoctorSlotsSynchronizer
     /**
      * @throws JsonException
      */
-    protected function getJsonDecode(string|bool $json): mixed
+    protected function getJsonDecode(string $json): array
     {
         return json_decode(
             json: false === $json ? '' : $json,
@@ -69,12 +99,10 @@ class DoctorSlotsSynchronizer
         );
     }
 
-    protected function getDoctors(): string
-    {
-        return $this->fetchData(self::ENDPOINT);
-    }
-
-    protected function fetchData(string $url): string|false
+    /**
+     * @throws \RuntimeException
+     */
+    protected function fetchData(string $url): string
     {
         $auth = base64_encode(
             sprintf(
@@ -84,7 +112,7 @@ class DoctorSlotsSynchronizer
             ),
         );
 
-        return @file_get_contents(
+        $data = @file_get_contents(
             filename: $url,
             context: stream_context_create(
                 [
@@ -94,6 +122,28 @@ class DoctorSlotsSynchronizer
                 ],
             ),
         );
+
+        if ($data === false) {
+            throw new \RuntimeException('Error loading data from external source');
+        }
+
+        return $data;
+    }
+
+    protected function fetchDoctorsData(): array
+    {
+        return $this->getJsonDecode($this->fetchData(self::ENDPOINT));
+    }
+
+    protected function fetchSlotsForDoctorData(int $doctorId): array
+    {
+        return $this->getJsonDecode($this->fetchData(self::ENDPOINT . '/' . $doctorId . '/slots'));
+    }
+
+    protected function getDoctor(int $doctorId): Doctor
+    {
+        return $this->getDoctorRepository()->find($doctorId) ??
+            new Doctor($doctorId, 'New unnamed doctor');
     }
 
     protected function normalizeName(string $fullName): string
@@ -110,43 +160,47 @@ class DoctorSlotsSynchronizer
 
     protected function save(Doctor|Slot $entity): void
     {
-        $em = $this->repository->createQueryBuilder('alias')->getEntityManager();
+        $em = $this->doctorRepository->createQueryBuilder('alias')->getEntityManager();
         $em->persist($entity);
         $em->flush();
     }
 
-    protected function fetchDoctorSlots(int $id): iterable
+    /**
+     * @return iterable<Slot>
+     */
+    protected function fetchDoctorSlots(int $doctorId): iterable
     {
         try {
-            $slots = $this->getJsonDecode($this->getSlots($id));
-            yield from $this->parseSlots($slots, $id);
-        } catch (JsonException) {
+            foreach ($this->fetchSlotsForDoctorData($doctorId) as $slotData) {
+                yield $this->parseSlotData($slotData, $doctorId);
+            };
+        } catch (\Exception $e) {
             if ($this->shouldReportErrors()) {
-                $this->logger->info('Error fetching slots for doctor', ['doctorId' => $id]);
+                $this->logger->info('Error fetching slots for doctor', [
+                    'doctorId' => $doctorId,
+                    'exception' => $e->getMessage(),
+                ]);
             }
-            yield false;
+            yield null;
         }
     }
 
-    protected function getSlots(int $id): string|false
+    protected function parseSlotData(array $slotData, int $doctorId): Slot
     {
-        return $this->fetchData(self::ENDPOINT . '/' . $id . '/slots');
+        $slot = $this->getSlot($doctorId, $slotData['start']);
+
+        if (!$slot->isStale()) {
+            $slot->setEnd(new DateTime($slotData['end']));
+        }
+
+        return $slot;
     }
 
-    protected function parseSlots(mixed $slots, int $id): iterable
+    protected function getSlot(int $doctorId, string $start): Slot
     {
-        foreach ($slots as $slot) {
-            $start = new DateTime($slot['start']);
-            $end = new DateTime($slot['end']);
-
-            /** @var Slot $entity */
-            $entity = $this->slots->findOneBy(['doctorId' => $id, 'start' => $start])
-                ?: new Slot($id, $start, $end);
-
-            if (false === $entity->isStale()) {
-                yield $entity->setEnd($end);
-            }
-        }
+        $startDatetime = new DateTime($start);
+        return $this->getSlotRepository()->findOneBy(['doctorId' => $doctorId, 'start' => $startDatetime]) ??
+            new Slot($doctorId, $startDatetime, new DateTime());
     }
 
     protected function shouldReportErrors(): bool

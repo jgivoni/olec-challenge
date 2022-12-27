@@ -16,7 +16,7 @@ final class Doctor
      * @ORM\Id
      * @ORM\Column(type="integer")
      */
-    private string $id;
+    private int $id;
 
     /**
      * @ORM\Column(type="string")
@@ -28,13 +28,13 @@ final class Doctor
      */
     private bool $error = false;
 
-    public function __construct(string $id, string $name)
+    public function __construct(int $id, string $name)
     {
         $this->id = $id;
         $this->name = $name;
     }
 
-    public function getId(): string
+    public function getId(): int
     {
         return $this->id;
     }
